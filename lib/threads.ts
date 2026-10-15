@@ -139,35 +139,110 @@ export function parseTarget(raw: string): Target | null {
 }
 
 async function resolveShare(code: string): Promise<Target | null> {
-  let current = `https://www.threads.com/share/${code}`;
+  const initialUrl = `https://www.threads.com/share/${encodeURIComponent(code)}`;
 
-  for (let hop = 0; hop < 4; hop++) {
-    try {
-      const response = await fetch(current, {
-        method: "GET",
-        redirect: "manual",
-        cache: "no-store",
-        headers: { "User-Agent": USER_AGENT, Accept: "text/html,*/*" },
-        signal: AbortSignal.timeout(8000),
-      });
+  try {
+    const response = await fetch(initialUrl, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
 
+    const finalUrl = response.url;
+    const finalTarget = finalUrl ? parseTarget(finalUrl) : null;
+
+    if (finalTarget && !finalTarget.share) {
       await response.body?.cancel().catch(() => undefined);
+      return finalTarget;
+    }
 
-      const location = response.headers.get("location");
-
-      if (!location) return null;
-
-      current = new URL(location, current).toString();
-
-      const target = parseTarget(current);
-
-      if (target && !target.share) return target;
-    } catch {
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
       return null;
     }
-  }
 
-  return null;
+    const contentType = response.headers.get("content-type") ?? "";
+
+    if (!contentType.includes("text/html")) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+
+    const html = (await response.text()).slice(0, 2_000_000);
+    const candidates: string[] = [];
+
+    const patterns = [
+      /<link\b[^>]*\brel=["']canonical["'][^>]*\bhref=["']([^"']+)["'][^>]*>/gi,
+      /<link\b[^>]*\bhref=["']([^"']+)["'][^>]*\brel=["']canonical["'][^>]*>/gi,
+      /<meta\b[^>]*\bproperty=["']og:url["'][^>]*\bcontent=["']([^"']+)["'][^>]*>/gi,
+      /<meta\b[^>]*\bcontent=["']([^"']+)["'][^>]*\bproperty=["']og:url["'][^>]*>/gi,
+    ];
+
+    for (const pattern of patterns) {
+      let match: RegExpExecArray | null;
+
+      while ((match = pattern.exec(html)) !== null) {
+        candidates.push(match[1]);
+      }
+    }
+
+    const embeddedPatterns = [
+      /https?:\\\/\\\/(?:www\\\.)?threads\\\.com\\\/@[^"'\\\s<>]+?\\\/post\\\/[\w-]{5,40}/gi,
+      /https?:\/\/(?:www\.)?threads\.com\/@[^"'\s<>]+?\/post\/[\w-]{5,40}/gi,
+      /https?:\/\/(?:www\.)?threads\.net\/@[^"'\s<>]+?\/post\/[\w-]{5,40}/gi,
+    ];
+
+    for (const pattern of embeddedPatterns) {
+      let match: RegExpExecArray | null;
+
+      while ((match = pattern.exec(html)) !== null) {
+        candidates.push(match[0]);
+      }
+    }
+
+    for (const candidate of candidates) {
+      const cleaned = candidate
+        .replace(/&amp;/g, "&")
+        .replace(/\\u0026/g, "&")
+        .replace(/\\u003d/g, "=")
+        .replace(/\\u002F/g, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&quot;/g, '"')
+        .trim();
+
+      try {
+        const url = new URL(cleaned, finalUrl || initialUrl);
+
+        const host = url.hostname.toLowerCase();
+
+        if (
+          host !== "threads.com" &&
+          host !== "www.threads.com" &&
+          host !== "threads.net" &&
+          host !== "www.threads.net"
+        ) {
+          continue;
+        }
+
+        const target = parseTarget(url.toString());
+
+        if (target && !target.share) {
+          return target;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function canonicalUrl(target: Target) {
@@ -397,12 +472,17 @@ export async function fetchThread(input: Target): Promise<ThreadData> {
   if (target.share) {
     const resolved = await resolveShare(target.code);
 
-    if (resolved) target = resolved;
+    if (!resolved) {
+      throw new ProviderError(
+        "Tautan Threads pendek tidak berhasil diarahkan ke postingan asli.",
+        422
+      );
+    }
+
+    target = resolved;
   }
 
-  const postUrl = target.share
-    ? `https://www.threads.com/share/${target.code}`
-    : canonicalUrl(target);
+  const postUrl = canonicalUrl(target);
 
   const [media, details] = await Promise.all([
     callEndpoint("/posts/media", postUrl, hasItems, 48_000),
