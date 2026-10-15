@@ -1,5 +1,7 @@
 import { proxyPath } from "@/lib/sign";
 
+const DEFAULT_HOST = "best-threads-scraper-free-1000-calls.p.rapidapi.com";
+
 type Json = Record<string, unknown>;
 
 export type Target = { code: string; username: string | null; share: boolean };
@@ -176,18 +178,11 @@ function canonicalUrl(target: Target) {
 
 function getConfig() {
   const key = process.env.RAPIDAPI_KEY;
-  const host = process.env.RAPIDAPI_HOST?.trim();
+  const host = process.env.RAPIDAPI_HOST?.trim() || DEFAULT_HOST;
 
   if (!key) {
     throw new ProviderError(
       "RAPIDAPI_KEY belum dikonfigurasi di environment Vercel.",
-      500
-    );
-  }
-
-  if (!host) {
-    throw new ProviderError(
-      "RAPIDAPI_HOST belum dikonfigurasi di environment Vercel.",
       500
     );
   }
