@@ -82,7 +82,7 @@ a {
 }
 
 .brand {
-  background: var(--grad);
+  background: var(--text);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
