@@ -97,9 +97,15 @@ function httpUrl(value: unknown): string | null {
 }
 
 export function parseTarget(raw: string): Target | null {
-  const value = raw.trim();
+  let value = raw.trim();
 
   if (!value) return null;
+
+  const embedded = value.match(
+    /(?:https?:\/\/)?(?:www\.|m\.)?threads\.(?:com|net)\/[^\s"'<>]+/i
+  );
+
+  if (embedded) value = embedded[0].replace(/[),.;]+$/, "");
 
   let parsed: URL;
 
@@ -138,65 +144,158 @@ export function parseTarget(raw: string): Target | null {
   return null;
 }
 
-async function resolveShare(code: string): Promise<Target | null> {
+const RESOLVE_AGENTS = [
+  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+  USER_AGENT,
+  "Twitterbot/1.0",
+  "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+];
+
+function unescapeText(text: string) {
+  return text
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&")
+    .replace(/&#x2F;/gi, "/")
+    .replace(/&#47;/g, "/");
+}
+
+function targetFromHtml(rawHtml: string): Target | null {
+  const html = unescapeText(rawHtml);
+
+  const priority: string[] = [];
+
+  for (const match of html.matchAll(/<meta\b[^>]*>|<link\b[^>]*>/gi)) {
+    const tag = match[0];
+
+    if (
+      /(property|name)=["'](og:url|twitter:url|al:web:url)["']/i.test(tag) ||
+      /rel=["']canonical["']/i.test(tag) ||
+      /http-equiv=["']refresh["']/i.test(tag)
+    ) {
+      const value = tag.match(/(?:content|href)=["']([^"']+)["']/i)?.[1];
+      const refresh = value?.match(/url=(.+)$/i)?.[1];
+
+      if (refresh) priority.push(refresh.trim());
+      else if (value) priority.push(value);
+    }
+  }
+
+  for (const match of html.matchAll(
+    /(?:location(?:\.href|\.replace)?\s*[=(]\s*)["']([^"']+)["']/gi
+  )) {
+    priority.push(match[1]);
+  }
+
+  for (const candidate of priority) {
+    const target = parseTarget(candidate);
+
+    if (target && !target.share) return target;
+  }
+
+  const generic = html.match(
+    /threads\.(?:com|net)\/@([\w.]{1,40})\/post\/([\w-]{5,40})/i
+  );
+
+  if (generic) {
+    return { code: generic[2], username: generic[1], share: false };
+  }
+
+  return null;
+}
+
+function targetFromLogin(url: URL): Target | null {
+  for (const key of ["next", "redirect", "redirect_uri", "return_to", "url"]) {
+    const value = url.searchParams.get(key);
+
+    if (!value) continue;
+
+    const target = parseTarget(
+      /^https?:\/\//i.test(value) ? value : new URL(value, url).toString()
+    );
+
+    if (target && !target.share) return target;
+  }
+
+  return null;
+}
+
+async function resolveShareWith(
+  code: string,
+  agent: string
+): Promise<Target | null> {
   let current = `https://www.threads.com/share/${code}`;
 
-  for (let hop = 0; hop < 5; hop++) {
+  for (let hop = 0; hop < 6; hop++) {
+    let response: Response;
+
     try {
-      const response = await fetch(current, {
+      response = await fetch(current, {
         method: "GET",
         redirect: "manual",
         cache: "no-store",
         headers: {
-          "User-Agent": USER_AGENT,
-          Accept: "text/html,application/xhtml+xml,*/*",
+          "User-Agent": agent,
+          Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
         },
         signal: AbortSignal.timeout(8000),
       });
-
-      const location = response.headers.get("location");
-
-      if (location) {
-        current = new URL(location, current).toString();
-        const target = parseTarget(current);
-
-        if (target && !target.share) return target;
-
-        continue;
-      }
-
-      const html = await response.text().catch(() => "");
-      const normalizedHtml = html
-        .replace(/\\\//g, "/")
-        .replace(/&amp;/g, "&");
-
-      const found = normalizedHtml.match(
-        /https?:\/\/(?:www\.)?threads\.(?:com|net)\/@[^\/"'\s?<>\\]+\/post\/[\w-]{5,40}(?:\?[^"'\s<>\\]*)?/i
-      );
-
-      if (found) {
-        const target = parseTarget(found[0]);
-
-        if (target && !target.share) return target;
-      }
-
-      const shortPost = normalizedHtml.match(
-        /https?:\/\/(?:www\.)?threads\.(?:com|net)\/t\/[\w-]{5,40}/i
-      );
-
-      if (shortPost) {
-        const target = parseTarget(shortPost[0]);
-
-        if (target && !target.share) return target;
-      }
-
-      return null;
     } catch {
       return null;
     }
+
+    const location = response.headers.get("location");
+
+    if (location) {
+      await response.body?.cancel().catch(() => undefined);
+
+      let next: URL;
+
+      try {
+        next = new URL(location, current);
+      } catch {
+        return null;
+      }
+
+      current = next.toString();
+
+      const target = parseTarget(current) ?? targetFromLogin(next);
+
+      if (target && !target.share) return target;
+
+      continue;
+    }
+
+    let html = "";
+
+    try {
+      html = (await response.text()).slice(0, 600_000);
+    } catch {
+      return null;
+    }
+
+    return targetFromHtml(html);
   }
 
   return null;
+}
+
+async function resolveShare(code: string): Promise<Target | null> {
+  const results = await Promise.all(
+    RESOLVE_AGENTS.map((agent) => resolveShareWith(code, agent))
+  );
+
+  const found = results.find((target) => target !== null) ?? null;
+
+  console.log(
+    `[threads] resolveShare code=${code} resolved=${
+      found ? `${found.username ?? "-"}/${found.code}` : "no"
+    }`
+  );
+
+  return found;
 }
 
 function canonicalUrl(target: Target) {
@@ -429,6 +528,8 @@ export async function fetchThread(input: Target): Promise<ThreadData> {
     if (resolved) target = resolved;
   }
 
+  const shareUnresolved = target.share;
+
   const postUrl = target.share
     ? `https://www.threads.com/share/${target.code}`
     : canonicalUrl(target);
@@ -442,6 +543,13 @@ export async function fetchThread(input: Target): Promise<ThreadData> {
     if (details.json && media.status !== 401 && media.status !== 403) {
       throw new ProviderError(
         "Postingan ini tidak berisi video atau foto yang bisa diunduh.",
+        422
+      );
+    }
+
+    if (shareUnresolved) {
+      throw new ProviderError(
+        "Tautan bagikan (share) tidak bisa diterjemahkan ke tautan postingan asli. Coba lagi, atau tempel tautan lengkap yang berbentuk threads.com/@username/post/...",
         422
       );
     }
